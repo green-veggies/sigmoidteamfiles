@@ -1,0 +1,289 @@
+================================================================
+  SIGMA DATA TECH — EC2 HANDS-ON LAB
+  Day 2 | Commands Reference Sheet
+================================================================
+
+
+----------------------------------------------------------------
+BLOCK 1 — CONNECT TO YOUR EC2
+----------------------------------------------------------------
+
+chmod 400 sigma-keypair.pem
+
+ssh -i sigma-keypair.pem ec2-user@<YOUR-EC2-IP>
+
+
+----------------------------------------------------------------
+BLOCK 2 — EXPLORE YOUR MACHINE
+----------------------------------------------------------------
+
+whoami
+
+hostname
+
+uname -a
+
+cat /etc/os-release
+
+nproc
+
+free -h
+
+df -h
+
+uptime
+
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+# Check public ip, private IP, instance type and Availability Zone
+
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/local-ipv4
+
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/public-ipv4
+
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/instance-type
+
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/placement/availability-zone
+
+
+----------------------------------------------------------------
+BLOCK 3 — INSTALL DE TOOLS
+----------------------------------------------------------------
+
+sudo yum update -y
+
+python3 --version
+
+pip3 --version
+
+pip3 install pandas numpy --quiet
+
+sudo yum install -y sqlite
+
+sudo yum install -y tree
+
+pip3 list | grep -E "pandas|numpy"
+
+sqlite3 --version
+
+
+----------------------------------------------------------------
+BLOCK 4 — CREATE PROJECT FOLDER
+----------------------------------------------------------------
+
+mkdir -p ~/sigma-de/data
+
+cd ~/sigma-de
+
+ls
+
+
+----------------------------------------------------------------
+BLOCK 5 — CREATE DATA GENERATOR SCRIPT
+----------------------------------------------------------------
+
+nano generate_data.py
+
+-------- PASTE THIS ENTIRE BLOCK INTO nano command --------
+
+import pandas as pd
+import random
+import os
+
+random.seed(42)
+
+merchants = ['Swiggy','Zomato','Amazon','Flipkart',
+             'Uber','Ola','BigBasket','PhonePe']
+statuses  = ['success','success','success','failed']
+customers = ['Priya Sharma','Rahul Verma','Anjali Gupta','Karthik Nair',
+             'Sneha Iyer','Vikram Mehta','Divya Menon','Arjun Das',
+             'Pooja Reddy','Suresh Kumar','Meera Pillai','Ravi Shankar',
+             'Nandita Roy','Aakash Singh','Deepa Nair','Harish Patel']
+cities    = ['Mumbai','Bengaluru','Delhi','Chennai','Hyderabad',
+             'Pune','Kolkata','Ahmedabad','Jaipur','Kochi']
+
+rows = []
+for i in range(1, 101):
+    rows.append({
+        'txn_id'   : f'TXN{i:04d}',
+        'customer' : random.choice(customers),
+        'merchant' : random.choice(merchants),
+        'amount'   : round(random.uniform(50, 5000), 2),
+        'status'   : random.choice(statuses),
+        'city'     : random.choice(cities)
+    })
+
+os.makedirs('data', exist_ok=True)
+df = pd.DataFrame(rows)
+df.to_csv('data/transactions.csv', index=False)
+print(f"Generated {len(df)} transactions")
+print(df.head())
+
+-------- SAVE: press Ctrl+O then Enter then Ctrl+X --------
+
+python3 generate_data.py
+
+
+----------------------------------------------------------------
+BLOCK 6 — CREATE PIPELINE SCRIPT (Bronze Silver Gold)
+----------------------------------------------------------------
+
+nano process_data.py
+
+-------- PASTE THIS ENTIRE BLOCK INTO nano --------
+
+import pandas as pd
+
+# BRONZE - raw
+df = pd.read_csv('data/transactions.csv')
+print(f"BRONZE: {len(df)} rows")
+
+# SILVER - clean
+df_clean = df[df['status'] == 'success'].dropna()
+print(f"SILVER: {len(df_clean)} rows after cleaning")
+
+# GOLD - aggregate
+summary = df_clean.groupby('merchant').agg(
+    transactions = ('txn_id',  'count'),
+    total_amount = ('amount',  'sum'),
+    avg_amount   = ('amount',  'mean')
+).round(2).sort_values('total_amount', ascending=False)
+
+print("\nGOLD: Merchant Summary")
+print(summary.to_string())
+
+df.to_csv('data/bronze.csv', index=False)
+df_clean.to_csv('data/silver.csv', index=False)
+summary.to_csv('data/gold.csv')
+print("\nAll 3 layers saved.")
+
+-------- SAVE: press Ctrl+O then Enter then Ctrl+X --------
+
+python3 process_data.py
+
+
+----------------------------------------------------------------
+BLOCK 7 — CHECK YOUR FILES
+----------------------------------------------------------------
+
+tree data/
+
+cat data/gold.csv
+
+
+----------------------------------------------------------------
+BLOCK 8 — LOAD DATA INTO SQLITE DATABASE
+----------------------------------------------------------------
+
+nano load_to_db.py
+
+-------- PASTE THIS ENTIRE BLOCK INTO nano --------
+
+import pandas as pd
+import sqlite3
+
+df = pd.read_csv('data/silver.csv')
+conn = sqlite3.connect('data/sigma.db')
+df.to_sql('transactions', conn, if_exists='replace', index=False)
+print(f"Loaded {len(df)} rows into sigma.db")
+conn.close()
+
+-------- SAVE: press Ctrl+O then Enter then Ctrl+X --------
+
+python3 load_to_db.py
+
+
+----------------------------------------------------------------
+BLOCK 9 — QUERY THE DATABASE
+----------------------------------------------------------------
+
+sqlite3 data/sigma.db
+
+-- Top merchants by revenue
+SELECT merchant,
+       COUNT(*) as txns,
+       ROUND(SUM(amount),2) as revenue
+FROM transactions
+GROUP BY merchant
+ORDER BY revenue DESC;
+
+
+-- High value transactions
+SELECT txn_id, customer, amount, city
+FROM transactions
+WHERE amount > 3000
+ORDER BY amount DESC
+LIMIT 5;
+
+
+-- Average spend by city
+SELECT city,
+       COUNT(*) as txns,
+       ROUND(AVG(amount),2) as avg_spend
+FROM transactions
+GROUP BY city
+ORDER BY avg_spend DESC
+LIMIT 10;
+
+
+-- Exit SQLite
+.quit
+
+
+----------------------------------------------------------------
+OPTIONAL  -  BLOCK 10 — AUTOMATE WITH CRON JOB
+----------------------------------------------------------------
+
+nano run_pipeline.sh
+
+-------- PASTE THIS ENTIRE BLOCK INTO nano --------
+
+#!/bin/bash
+cd ~/sigma-de
+echo "Pipeline run at: $(date)" >> pipeline.log
+python3 generate_data.py >> pipeline.log 2>&1
+python3 process_data.py >> pipeline.log 2>&1
+echo "Done." >> pipeline.log
+echo "---" >> pipeline.log
+
+-------- SAVE: press Ctrl+O then Enter then Ctrl+X --------
+
+chmod +x run_pipeline.sh
+
+./run_pipeline.sh
+
+cat pipeline.log
+
+
+-- Schedule it to run every minute
+crontab -e
+
+-------- ADD THIS ONE LINE then save (Ctrl+O Enter Ctrl+X) --------
+
+* * * * * /home/ec2-user/sigma-de/run_pipeline.sh
+
+
+-- Wait 2 minutes then check
+cat pipeline.log
+
+
+-- Remove the schedule after demo
+crontab -r
+
+
+----------------------------------------------------------------
+BLOCK 11 — SEE EVERYTHING YOU BUILT
+----------------------------------------------------------------
+
+tree ~/sigma-de
+
+
+================================================================
+  YOU ARE DONE!
+  Raise your hand when pipeline.log shows 3 or more runs
+================================================================
